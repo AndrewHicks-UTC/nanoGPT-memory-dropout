@@ -22,10 +22,6 @@ if __name__ == '__main__':
     # takes 54GB in huggingface .cache dir, about 8M documents (8,013,769)
     dataset = load_dataset("Salesforce/wikitext", "wikitext-103-v1", num_proc=num_proc_load_dataset)
 
-    # merge the train and val splits
-    dataset['test'] = concatenate_datasets([dataset['test'], dataset['validation']])
-    dataset.pop('validation')
-
     # shuffle
     shuffled = dataset.shuffle(seed=0)
 
