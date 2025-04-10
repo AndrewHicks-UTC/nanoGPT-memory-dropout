@@ -76,7 +76,7 @@ class CausalSelfAttention(nn.Module):
 
         # construct attention mask
         attn_mask = self._construct_attn_mask(B, T, x.device)
-        attn_mask = attn_mask.expand(B, self.n_head, T, T)
+        attn_mask = attn_mask.reshape(B, 1, T, T)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0)
