@@ -41,13 +41,29 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.memory_dropout = config.memory_dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+        flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not flash:
+            raise NotImplementedError("Flash Attention requires PyTorch >= 2.0")
+    
+    def _construct_attn_mask(self, B, T, device):
+        # normal causal self-attention mask
+        attn_mask = torch.triu(torch.full((B, T, T), float("-inf"), device=device), diagonal=1)
+
+        if self.training:
+            # tokens always attend to themselves, otherwise there can be dropout
+            probability_mask = torch.tril(torch.full((B, T, T), self.memory_dropout, device=device), diagonal=-1)
+            dropout_mask = torch.bernoulli(probability_mask)
+
+            # contruct dropout mask (first dropout can happen in row 1, first cumulative dropout can happen in row 2)
+            for i in range(2, T):
+                dropout_mask[:, i, :] += dropout_mask[:, i - 1, :]
+            
+            # set dropped out values to -inf
+            attn_mask = attn_mask.masked_fill(dropout_mask.bool(), float("-inf"))
+
+        return attn_mask
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -58,18 +74,14 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        # construct attention mask
+        attn_mask = self._construct_attn_mask(B, T, x.device)
+
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0)
+
+        # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
@@ -113,6 +125,7 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
+    memory_dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 class GPT(nn.Module):
@@ -208,7 +221,7 @@ class GPT(nn.Module):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
+        assert all(k in ['dropout', 'memory_dropout'] for k in override_args)
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
@@ -227,6 +240,9 @@ class GPT(nn.Module):
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
+        if 'memory_dropout' in override_args:
+            print(f"overriding memory dropout rate to {override_args['memory_dropout']}")
+            config_args['memory_dropout'] = override_args['memory_dropout']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
