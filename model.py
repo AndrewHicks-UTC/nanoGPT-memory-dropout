@@ -41,31 +41,12 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.memory_dropout = config.memory_dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not flash:
             raise NotImplementedError("Flash Attention requires PyTorch >= 2.0")
-    
-    def _construct_attn_mask(self, B, T, device):
-        # normal causal self-attention mask
-        attn_mask = torch.triu(torch.full((B, T, T), float("-inf"), device=device), diagonal=1)
 
-        if self.training:
-            # tokens always attend to themselves, otherwise there can be dropout
-            probability_mask = torch.tril(torch.full((B, T, T), self.memory_dropout, device=device), diagonal=-1)
-            dropout_mask = torch.bernoulli(probability_mask)
-
-            # contruct dropout mask (first dropout can happen in row 1, first cumulative dropout can happen in row 2)
-            for i in range(2, T):
-                dropout_mask[:, i, :] += dropout_mask[:, i - 1, :]
-            
-            # set dropped out values to -inf
-            attn_mask = attn_mask.masked_fill(dropout_mask.bool(), float("-inf"))
-
-        return attn_mask
-
-    def forward(self, x):
+    def forward(self, x, attn_mask):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -73,10 +54,6 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        # construct attention mask
-        attn_mask = self._construct_attn_mask(B, T, x.device)
-        attn_mask = attn_mask.reshape(B, 1, T, T)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0)
@@ -180,6 +157,24 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def _construct_attn_mask(self, B, T, device):
+        # normal causal self-attention mask
+        attn_mask = torch.triu(torch.full((B, T, T), float("-inf"), device=device), diagonal=1)
+
+        if self.training:
+            # tokens always attend to themselves, otherwise there can be dropout
+            probability_mask = torch.tril(torch.full((B, T, T), self.config.memory_dropout, device=device), diagonal=-1)
+            dropout_mask = torch.bernoulli(probability_mask)
+
+            # contruct dropout mask (first dropout can happen in row 1, first cumulative dropout can happen in row 2)
+            for i in range(2, T):
+                dropout_mask[:, i, :] += dropout_mask[:, i - 1, :]
+            
+            # set dropped out values to -inf
+            attn_mask = attn_mask.masked_fill(dropout_mask.bool(), float("-inf"))
+
+        return attn_mask
 
     def forward(self, idx, targets=None):
         device = idx.device
@@ -187,12 +182,16 @@ class GPT(nn.Module):
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
+        # construct attention mask
+        attn_mask = self._construct_attn_mask(b, t, idx.device)
+        attn_mask = attn_mask.reshape(b, 1, t, t)
+
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, attn_mask)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
